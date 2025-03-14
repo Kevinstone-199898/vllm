@@ -1,3 +1,9 @@
+## 安装vllm环境
+```
+VLLM_USE_PRECOMPILED=1 pip install --e . -v
+```
+
+
 ## Start Server
 
 ```
