@@ -51,7 +51,7 @@ for ((i = 1; i <= worker_num; i++)); do
     sleep 5
 done
 
-if [ $# -lt 2 ]; then
+if [ $# -lt 1 ]; then
     echo "输入模型路径"
     exit 1
 else
@@ -59,7 +59,6 @@ else
     export SPARSITY=0.2 
     export SAVE_SCORE=1
     export NUM_LAYERS=$(grep '"num_hidden_layers"' ${MODEL_PATH}/config.json | awk -F ': ' '{print $2}' | tr -d ', ')
-        exit 1
     vllm serve $MODEL_PATH --enforce-eager \
     --enable-reasoning --reasoning-parser deepseek_r1 \
     --tensor-parallel-size 8 --pipeline-parallel-size 2 \
