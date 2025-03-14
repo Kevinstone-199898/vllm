@@ -7,6 +7,8 @@ from typing import Iterator, List, Optional, Union
 
 import cloudpickle
 import zmq
+import csv
+import os
 
 from vllm import AsyncEngineArgs, SamplingParams
 from vllm.engine.llm_engine import LLMEngine
@@ -181,6 +183,19 @@ class MQLLMEngine:
             socket.send_multipart((identity, pickle.dumps(response)),
                                   copy=False)
 
+    def get_folder(self, folder):
+        latest_dir = None
+        max_mtime = 0
+
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    mtime = entry.stat().st_mtime
+                    if mtime > max_mtime:
+                        max_mtime = mtime
+                        latest_dir = entry.path  # 或 entry.name 仅获取名称
+        return latest_dir
+
     def run_engine_loop(self):
         """Core busy loop of the LLMEngine."""
 
@@ -199,6 +214,15 @@ class MQLLMEngine:
 
             # Engine step.
             request_outputs = self.engine_step()
+            if(len(request_outputs) > 0):
+                local_folder = os.path.abspath(os.getcwd())
+                main_folder = f"{local_folder}/attn_scores"
+                folder = self.get_folder(main_folder)
+                file_name = f"{folder}/token_ids.csv"
+                with open(file_name, 'a', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(request_outputs[0].prompt_token_ids)
+                    writer.writerow(request_outputs[0].outputs[0].token_ids)
 
             # Send request outputs (if async, done in engine_step callback).
             if not self.use_async_sockets:

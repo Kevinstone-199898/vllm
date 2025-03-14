@@ -551,7 +551,8 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             attn_weights , _ = self.compute_attn_score(q_pe, q_nope, k_pe_cache, kv_c_cache, attn_metadata.seq_lens) 
 
             if(self.layer_idx != None and self.save_score):
-                main_folder = f"/home/fit/cwg/WORK/sxy/heat_map/attn_scores"
+                cur_dir = os.path.abspath(os.getcwd())
+                main_folder = f"{cur_dir}/attn_scores"
                 folder = self.get_folder(main_folder)
                 file_name = f"{folder}/layer_{self.layer_idx+1}/tp_{self.rank}.csv"
                 if os.path.exists(file_name):

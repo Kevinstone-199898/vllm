@@ -51,7 +51,8 @@ class RequestLogger:
         if(self.save_score != None):
             current_time = datetime.datetime.now()
             formatted_time = current_time.strftime("%Y-%m-%d-%H-%M-%S")
-            folder = f"/home/fit/cwg/WORK/sxy/heat_map/attn_scores/{formatted_time}"
+            cur_dir = os.path.abspath(os.getcwd())
+            folder = f"{cur_dir}/attn_scores/{formatted_time}"
             os.makedirs(folder)
             file = f"{folder}/prompt.txt"
             for i in range(int(self.layers)):
