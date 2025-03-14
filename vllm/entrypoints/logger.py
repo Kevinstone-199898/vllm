@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import BeamSearchParams, SamplingParams
+import os
+import datetime
+import csv
 
 logger = init_logger(__name__)
 
@@ -17,12 +20,14 @@ class RequestLogger:
         super().__init__()
 
         self.max_log_len = max_log_len
+        self.save_score = os.getenv('SAVE_SCORE')
+        self.layers = os.getenv('NUM_LAYERS')
 
     def log_inputs(
         self,
         request_id: str,
         prompt: Optional[str],
-        prompt_token_ids: Optional[List[int]],
+        prompt_token_ids: Optional[list[int]],
         params: Optional[Union[SamplingParams, PoolingParams,
                                BeamSearchParams]],
         lora_request: Optional[LoRARequest],
@@ -42,3 +47,16 @@ class RequestLogger:
             "lora_request: %s, prompt_adapter_request: %s.", request_id,
             prompt, params, prompt_token_ids, lora_request,
             prompt_adapter_request)
+
+        if(self.save_score != None):
+            current_time = datetime.datetime.now()
+            formatted_time = current_time.strftime("%Y-%m-%d-%H-%M-%S")
+            folder = f"/home/fit/cwg/WORK/sxy/heat_map/attn_scores/{formatted_time}"
+            os.makedirs(folder)
+            file = f"{folder}/prompt.txt"
+            for i in range(int(self.layers)):
+                layer_flder = f"{folder}/layer_{i+1}"
+                os.makedirs(layer_flder)
+            with open(file, 'w', encoding='utf-8') as file:
+                file.write(prompt)
+            logger.info("Writing to %s.", folder)

@@ -349,6 +349,7 @@ class DeepseekV2MLAAttention(nn.Module):
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -446,6 +447,7 @@ class DeepseekV2MLAAttention(nn.Module):
             q_proj=self.q_proj if self.q_lora_rank is None else self.q_b_proj,
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
+            layer_idx=layer_idx,
         )
 
         self.prefix = prefix
@@ -509,6 +511,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            layer_idx=layer_idx,
         )
 
         if (config.n_routed_experts is not None

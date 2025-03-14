@@ -15,7 +15,8 @@ from vllm.attention.backends.abstract import (AttentionLayer,
                                               MLAAttentionImpl, T)
 from vllm.attention.backends.utils import get_flash_attn_version
 from vllm.distributed import (get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+                              tensor_model_parallel_all_reduce,
+                              get_tensor_model_parallel_rank)
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearBase, RowParallelLinear,
                                                UnquantizedLinearMethod)
@@ -35,6 +36,11 @@ try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 except ImportError:
     from flash_attn import flash_attn_varlen_func
+import csv
+from vllm.logger import init_logger
+import os
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -135,7 +141,6 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
     for less flops and memory usage.
 
     """
-
     def __init__(
         self,
         num_heads: int,
@@ -162,6 +167,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         q_proj: ColumnParallelLinear,
         kv_b_proj: ColumnParallelLinear,
         o_proj: RowParallelLinear,
+        layer_idx: Optional[int] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -182,16 +188,44 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         self.q_proj = q_proj
         self.kv_b_proj = kv_b_proj
         self.o_proj = o_proj
-        self.vllm_flash_attn_version = get_flash_attn_version()
+        self.sparsity = os.getenv('SPARSITY')
+        # print(f"--->sparsity: {self.sparsity}")
+        self.top_k = os.getenv('TOP_K')
+        # print(f"--->top_k: {self.top_k}")
+        self.layer_idx = layer_idx
+        # print(f"--->layer_idx: {self.layer_idx}")
+        self.save_score = 1
 
-        # Handle the differences between the flash_attn_varlen from flash_attn
-        # and the one from vllm_flash_attn. The former is used on RoCM and the
-        # latter has an additional parameter to control FA2 vs FA3
-        self.flash_attn_varlen_func = flash_attn_varlen_func
-        if self.vllm_flash_attn_version is not None:
-            self.flash_attn_varlen_func = \
-                functools.partial(flash_attn_varlen_func,
-                                  fa_version=self.vllm_flash_attn_version)
+    @torch.compile
+    def get_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata:T
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 获取解码序列的batch大小
+        bsz = attn_metadata.num_decode_tokens
+        max_seq_len = max(attn_metadata.seq_lens)
+        kv_c_cache = torch.zeros((bsz, max_seq_len, self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+        k_pe_cache = torch.zeros((bsz, max_seq_len, kv_cache.shape[2] - self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+
+        for i in range(bsz):
+            kv_c_and_k_pe_cache = torch.zeros(0, kv_cache.shape[2]).to(kv_cache.device)
+            seq_len = attn_metadata.seq_lens[i]
+            block_table = attn_metadata.block_tables[i]
+            slot_mapping = attn_metadata.slot_mapping[i]
+
+            block_size = kv_cache.shape[1]
+            num_blocks = (seq_len + block_size - 1) // block_size
+            for index in range(num_blocks):
+                j = block_table[index]
+                if index == num_blocks - 1:
+                    end_slot = slot_mapping - j*kv_cache.shape[1] + 1
+                    kv_c_and_k_pe_cache = torch.cat((kv_c_and_k_pe_cache, kv_cache[j][:end_slot]), dim=0) 
+                    break
+                kv_c_and_k_pe_cache = torch.cat((kv_c_and_k_pe_cache, kv_cache[j]), dim=0)
+            kv_c_cache[i][:attn_metadata.seq_lens[i], :] = kv_c_and_k_pe_cache[..., :self.kv_lora_rank]
+            k_pe_cache[i][:attn_metadata.seq_lens[i], :] = kv_c_and_k_pe_cache[..., self.kv_lora_rank:]
+        return kv_c_cache, k_pe_cache
 
     def _v_up_proj_and_o_proj(self, x):
         if envs.VLLM_MLA_PERFORM_MATRIX_ABSORPTION:
@@ -387,6 +421,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 self.W_UV_O = W_UV_O.to(act_dtype)
 
             self.tp_size = get_tensor_model_parallel_world_size()
+            self.rank = get_tensor_model_parallel_rank()
         else:
             if is_fp8(weight_dtype):
                 raise NotImplementedError(
@@ -415,6 +450,162 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         attn_metadata: T,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+    def choose_top_k(
+        self,
+        logits: torch.Tensor,
+        top_k: int,
+    ) -> torch.Tensor:
+        mean = torch.mean(logits, dim=1)
+        _, indices = torch.topk(mean, top_k)
+        return indices
+    
+    @torch.compile
+    def compute_attn_score(
+        self,
+        q_pe: torch.Tensor, 
+        q_nope: torch.Tensor,
+        k_pe_cache: torch.Tensor,
+        kv_c_cache: torch.Tensor,
+        seq_lens: List,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn_weights_pe = torch.matmul(q_pe, k_pe_cache.transpose(1, 2))
+        attn_weights_nope = torch.matmul(q_nope, kv_c_cache.transpose(1, 2))
+        logits = (attn_weights_pe + attn_weights_nope) * self.scale
+        seq_lens = torch.tensor(seq_lens, device=logits.device)
+        mask = torch.arange(logits.size(2), device=logits.device) >= seq_lens.view(-1, 1, 1)
+        logits.masked_fill_(mask, float('-inf'))
+        lse = logits.logsumexp(dim=-1)
+        attn_weights = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32).to(q_nope.dtype)
+        return attn_weights, lse
+    
+    def flash_attn_score(
+        self,
+        q_pe: torch.Tensor, 
+        q_nope: torch.Tensor,
+        k_pe_cache: torch.Tensor,
+        kv_c_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q = torch.cat([q_nope, q_pe], dim=-1).unsqueeze(1) #[bsz, num_heads, head_dim]
+        k =  torch.cat([kv_c_cache, k_pe_cache], dim=-1).unsqueeze(2) #[bsz, num_heads, head_dim]
+        s_q = 1
+        h_q = q.shape[-2]
+        h_kv = 1
+        dv = self.kv_lora_rank #self.kv_lora_rank
+        d=self.kv_lora_rank + self.qk_rope_head_dim
+        b = q.shape[0]
+
+        max_seqlen = cache_seqlens.max().item()
+        import triton
+        max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
+        tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, s_q * h_q // h_kv, h_kv)
+
+        block_size = 64
+        block_table = torch.arange(
+            b * max_seqlen_pad // block_size, dtype=torch.int32, device=q.device
+        ).view(b, max_seqlen_pad // block_size)
+        blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d, dtype=k.dtype, device=q.device)
+        for i in range(b):
+            blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, :cache_seqlens[i].item()] = k[i][:cache_seqlens[i],:,:]
+            blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
+        flash_out, flash_lse = flash_mla_with_kvcache(
+            q,
+            blocked_k,
+            block_table,
+            cache_seqlens,
+            dv,
+            tile_scheduler_metadata,
+            num_splits,
+            causal=True,
+            softmax_scale=self.scale
+        )
+        return flash_out.squeeze(1), flash_lse.squeeze(-1)
+    
+    def get_folder(self, folder):
+        latest_dir = None
+        max_mtime = 0
+
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    mtime = entry.stat().st_mtime
+                    if mtime > max_mtime:
+                        max_mtime = mtime
+                        latest_dir = entry.path  # 或 entry.name 仅获取名称
+        return latest_dir
+
+    def absorbed_forward(
+        self,
+        q_nope: torch.Tensor, 
+        q_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: T,
+        top_k: str = None,
+        sparsity: str = None,
+    ):
+        if(attn_metadata.seq_lens != None):
+            bsz = attn_metadata.num_decode_tokens
+            kv_c_cache, k_pe_cache = self.get_kv_cache(kv_cache, attn_metadata)
+            attn_weights , _ = self.compute_attn_score(q_pe, q_nope, k_pe_cache, kv_c_cache, attn_metadata.seq_lens) 
+
+            if(self.layer_idx != None and self.save_score):
+                main_folder = f"/home/fit/cwg/WORK/sxy/heat_map/attn_scores"
+                folder = self.get_folder(main_folder)
+                file_name = f"{folder}/layer_{self.layer_idx+1}/tp_{self.rank}.csv"
+                if os.path.exists(file_name):
+                    with open(file_name, mode='a', newline='') as file:
+                        writer = csv.writer(file)
+                        for i in range(attn_weights.size(1)):
+                            writer.writerow(attn_weights[0][i].to(torch.float32).cpu().numpy())
+                else:
+                    with open(file_name, mode='w', newline='') as file:
+                        writer = csv.writer(file)
+                        for i in range(attn_weights.size(1)):
+                            writer.writerow(attn_weights[0][i].to(torch.float32).cpu().numpy())
+            return
+
+            if(top_k != None):
+                #sparse top-k
+                top_k = int(top_k)
+                index = self.choose_top_k(attn_weights, top_k)
+                index = torch.sort(index, dim=1).values
+                selected_k_pe_cache = k_pe_cache[torch.arange(k_pe_cache.size(0)).unsqueeze(1), index]
+                selected_kv_c_cache = kv_c_cache[torch.arange(kv_c_cache.size(0)).unsqueeze(1), index]
+                selected_attn_weights , _ = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, [top_k]*len(attn_metadata.seq_lens))
+                attn_output = torch.matmul(selected_attn_weights, selected_kv_c_cache)   
+            elif (sparsity != None):
+                sparsity = float(sparsity)
+                import math
+                top_k = [math.ceil(x * sparsity) for x in attn_metadata.seq_lens]
+                max_len = max(top_k)
+                selected_k_pe_cache = torch.zeros((bsz, max_len, k_pe_cache.size(2)), device=k_pe_cache.device, dtype=k_pe_cache.dtype)
+                selected_kv_c_cache = torch.zeros((bsz, max_len, kv_c_cache.size(2)), device=kv_c_cache.device, dtype=kv_c_cache.dtype)
+                for i in range(len(attn_metadata.seq_lens)):
+                    index = torch.topk(torch.mean(attn_weights[i],dim=0), top_k[i]).indices
+                    index = torch.sort(index).values
+                    selected_k_pe_cache[i][:top_k[i], :] = k_pe_cache[i][index]
+                    selected_kv_c_cache[i][:top_k[i], :] = kv_c_cache[i][index]
+                # mla_data = {}
+                # mla_data['selected_k_pe_cache'] = selected_k_pe_cache
+                # mla_data['selected_kv_c_cache'] = selected_kv_c_cache
+                # mla_data["q_pe"] = q_pe
+                # mla_data["q_nope"] = q_nope
+                # mla_data["attn_metadata"] = attn_metadata
+                # mla_data["top_k"] = top_k
+                selected_attn_weights, lse = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, top_k)
+                attn_output = torch.matmul(selected_attn_weights, selected_kv_c_cache)
+                # mla_data["attn_output"] = attn_output
+                # mla_data["lse"] = lse
+                # torch.save(mla_data, "mla_data.pt")
+                # exit()
+            else:
+                attn_output = torch.matmul(attn_weights, kv_c_cache)
+            return self._v_up_proj_and_o_proj(attn_output)
+        else:
+            return torch.zeros((attn_metadata.num_decode_tokens, self.v_head_dim*self.num_heads), device=self.W_UV_O.device, dtype=self.W_UV_O.dtype)
+    
 
     def forward(
         self,
@@ -473,6 +664,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata)
 
         if attn_metadata.decode_metadata is not None:
+            self.absorbed_forward(q_nope, q_pe, kv_cache, attn_metadata, top_k=self.top_k, sparsity=self.sparsity)
             return self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata)
 
     # Optional common flash-attn based prefill
@@ -497,7 +689,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         v_padded = torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]],
                                            value=0)
 
-        attn_output = self.flash_attn_varlen_func(
+        attn_output = flash_attn_varlen_func(
             q=q,
             k=k,
             v=v_padded,
