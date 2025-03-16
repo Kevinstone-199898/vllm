@@ -9,6 +9,7 @@ import cloudpickle
 import zmq
 import csv
 import os
+from datetime import datetime
 
 from vllm import AsyncEngineArgs, SamplingParams
 from vllm.engine.llm_engine import LLMEngine
@@ -184,17 +185,20 @@ class MQLLMEngine:
                                   copy=False)
 
     def get_folder(self, folder):
-        latest_dir = None
-        max_mtime = 0
-
+        # 定义时间格式解析器
+        time_format = "%Y-%m-%d-%H-%M-%S"
+        datetime_objects = []
         with os.scandir(folder) as entries:
             for entry in entries:
-                if entry.is_dir():
-                    mtime = entry.stat().st_mtime
-                    if mtime > max_mtime:
-                        max_mtime = mtime
-                        latest_dir = entry.path  # 或 entry.name 仅获取名称
-        return latest_dir
+                if entry.is_dir():    
+                    # 将字符串转换为datetime对象
+                    datetime_objects.append(datetime.strptime(os.path.basename(entry.path), time_format))
+                    
+                    # 找到最晚时间
+                    latest_datetime = max(datetime_objects)
+                    
+        # 还原为原始格式字符串
+        return f"{folder}/{latest_datetime.strftime(time_format)}"
 
     def run_engine_loop(self):
         """Core busy loop of the LLMEngine."""
@@ -215,6 +219,7 @@ class MQLLMEngine:
             # Engine step.
             request_outputs = self.engine_step()
             if(len(request_outputs) > 0):
+                logger.info("=====writing tokens=====")
                 local_folder = os.path.abspath(os.getcwd())
                 main_folder = f"{local_folder}/attn_scores"
                 folder = self.get_folder(main_folder)

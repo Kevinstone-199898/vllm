@@ -1,11 +1,14 @@
 #!/bin/bash
-#SBATCH --output=log/v2_%j.log
-#SBATCH --job-name=deepseek-v2
-#SBATCH --nodes=2
+#SBATCH --output=log/small_R1_%j.log
+#SBATCH --job-name=deepseek-r1-small
+#SBATCH --nodes=1
 #SBATCH --cpus-per-task=30
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:8
 #SBATCH --tasks-per-node=1
-#SBATCH --partition=a01
+#SBATCH --partition=h01
+
+cp /home/fit/cwg/WORK/sxy/deepseek-r1-config/small_model.safetensors.index.json /home/fit/cwg/WORK/model/Deepseek-R1/model.safetensors.index.json
+cp /home/fit/cwg/WORK/sxy/deepseek-r1-config/small_config.json /home/fit/cwg/WORK/model/Deepseek-R1/config.json
 
 # Getting the node names
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -29,12 +32,12 @@ fi
 port=6379
 ip_head=$head_node_ip:$port
 export ip_head
-echo $head_node_ip > ip.txt
+echo "IP Head: $ip_head"
 
 echo "Starting HEAD at $head_node using ${SLURM_CPUS_PER_TASK} cpus and 8 gpus"
 srun --nodes=1 --ntasks=1 -w "$head_node" \
     ray start --head --port=$port \
-    --num-cpus "${SLURM_CPUS_PER_TASK}" --num-gpus 2 --block &
+    --num-cpus "${SLURM_CPUS_PER_TASK}" --num-gpus 8 --block &
 
 # optional, though may be useful in certain versions of Ray < 1.0.
 sleep 10
@@ -47,7 +50,7 @@ for ((i = 1; i <= worker_num; i++)); do
     echo "Starting WORKER $i at $node_i using ${SLURM_CPUS_PER_TASK} cpus and 8 gpus"
     srun --nodes=1 --ntasks=1 -w "$node_i" \
         ray start --address "$ip_head" \
-        --num-cpus "${SLURM_CPUS_PER_TASK}" --num-gpus 2 --block &
+        --num-cpus "${SLURM_CPUS_PER_TASK}" --num-gpus 8 --block &
     sleep 5
 done
 
@@ -60,7 +63,8 @@ else
     export SAVE_SCORE=1
     export NUM_LAYERS=$(grep '"num_hidden_layers"' ${MODEL_PATH}/config.json | awk -F ': ' '{print $2}' | tr -d ', ')
     vllm serve $MODEL_PATH --enforce-eager \
-    --tensor-parallel-size 2 --pipeline-parallel-size 2 \
+    --enable-reasoning --reasoning-parser deepseek_r1 \
+    --tensor-parallel-size 8 --pipeline-parallel-size 1 \
     --distributed-executor-backend=ray --trust-remote-code \
     --uvicorn-log-level debug
 fi

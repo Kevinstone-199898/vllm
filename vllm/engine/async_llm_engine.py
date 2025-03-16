@@ -36,6 +36,9 @@ from vllm.sequence import ExecuteModelRequest
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import deprecate_kwargs, weak_bind
+import os
+import csv
+from datetime import datetime
 
 logger = init_logger(__name__)
 ENGINE_ITERATION_TIMEOUT_S = envs.VLLM_ENGINE_ITERATION_TIMEOUT_S
@@ -876,6 +879,22 @@ class AsyncLLMEngine(EngineClient):
             RequestOutput, PoolingRequestOutput], None]]:
         ...
 
+    def get_folder(self, folder):
+        # 定义时间格式解析器
+        time_format = "%Y-%m-%d-%H-%M-%S"
+        datetime_objects = []
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_dir():    
+                    # 将字符串转换为datetime对象
+                    datetime_objects.append(datetime.strptime(os.path.basename(entry.path), time_format))
+                    
+                    # 找到最晚时间
+                    latest_datetime = max(datetime_objects)
+                    
+        # 还原为原始格式字符串
+        return f"{folder}/{latest_datetime.strftime(time_format)}"
+
     @deprecate_kwargs(
         "inputs",
         additional_message="Please use the 'prompt' parameter instead.",
@@ -1012,6 +1031,15 @@ class AsyncLLMEngine(EngineClient):
                     prompt_adapter_request=prompt_adapter_request,
                     priority=priority,
             ):
+                logger.info("===== async writing tokens=====")
+                local_folder = os.path.abspath(os.getcwd())
+                main_folder = f"{local_folder}/attn_scores"
+                folder = self.get_folder(main_folder)
+                file_name = f"{folder}/token_ids.csv"
+                with open(file_name, 'a', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(output.prompt_token_ids)
+                    writer.writerow(output.outputs[0].token_ids)
                 yield LLMEngine.validate_output(output, RequestOutput)
         except asyncio.CancelledError:
             await self.abort(request_id)

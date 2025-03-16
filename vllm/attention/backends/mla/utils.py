@@ -39,6 +39,7 @@ except ImportError:
 import csv
 from vllm.logger import init_logger
 import os
+from datetime import datetime
 
 logger = init_logger(__name__)
 
@@ -524,17 +525,18 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         return flash_out.squeeze(1), flash_lse.squeeze(-1)
     
     def get_folder(self, folder):
-        latest_dir = None
-        max_mtime = 0
-
+        # 定义时间格式解析器
+        time_format = "%Y-%m-%d-%H-%M-%S"
+        datetime_objects = []
         with os.scandir(folder) as entries:
             for entry in entries:
-                if entry.is_dir():
-                    mtime = entry.stat().st_mtime
-                    if mtime > max_mtime:
-                        max_mtime = mtime
-                        latest_dir = entry.path  # 或 entry.name 仅获取名称
-        return latest_dir
+                if entry.is_dir():    
+                    # 将字符串转换为datetime对象
+                    datetime_objects.append(datetime.strptime(os.path.basename(entry.path), time_format))
+                    
+                    # 找到最晚时间
+                    latest_datetime = max(datetime_objects)
+        return f"{folder}/{latest_datetime.strftime(time_format)}"
 
     def absorbed_forward(
         self,

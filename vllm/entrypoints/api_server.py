@@ -121,7 +121,6 @@ async def run_server(args: Namespace,
     logger.info("args: %s", args)
 
     set_ulimit()
-
     app = await init_app(args, llm_engine)
     assert engine is not None
 
