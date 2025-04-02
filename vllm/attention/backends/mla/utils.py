@@ -32,9 +32,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding)
 
-try:
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
-except ImportError:
+if False:
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+    except ImportError:
+        from flash_attn import flash_attn_varlen_func
+else:
+    # To work on ROCm platform.
     from flash_attn import flash_attn_varlen_func
 import csv
 from vllm.logger import init_logger
