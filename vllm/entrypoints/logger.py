@@ -48,16 +48,16 @@ class RequestLogger:
             prompt, params, prompt_token_ids, lora_request,
             prompt_adapter_request)
 
-        if(self.save_score != None):
-            current_time = datetime.datetime.now()
-            formatted_time = current_time.strftime("%Y-%m-%d-%H-%M-%S")
-            cur_dir = os.path.abspath(os.getcwd())
-            folder = f"{cur_dir}/attn_scores/{formatted_time}"
-            os.makedirs(folder)
-            file = f"{folder}/prompt.txt"
-            for i in range(int(self.layers)):
-                layer_flder = f"{folder}/layer_{i+1}"
-                os.makedirs(layer_flder)
-            with open(file, 'w', encoding='utf-8') as file:
-                file.write(prompt)
-            logger.info("Writing to %s.", folder)
+        # if(self.save_score != None):
+        #     current_time = datetime.datetime.now()
+        #     formatted_time = current_time.strftime("%Y-%m-%d-%H-%M-%S")
+        #     cur_dir = os.path.abspath(os.getcwd())
+        #     folder = f"{cur_dir}/attn_scores/{formatted_time}"
+        #     os.makedirs(folder)
+        #     file = f"{folder}/prompt.txt"
+        #     for i in range(int(self.layers)):
+        #         layer_folder = f"{folder}/layer_{i+1}"
+        #         os.makedirs(layer_folder)
+        #     with open(file, 'w', encoding='utf-8') as file:
+        #         file.write(prompt)
+        #     logger.info("Writing to %s.", folder)

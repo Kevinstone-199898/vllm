@@ -218,16 +218,16 @@ class MQLLMEngine:
 
             # Engine step.
             request_outputs = self.engine_step()
-            if(len(request_outputs) > 0):
-                logger.info("=====writing tokens=====")
-                local_folder = os.path.abspath(os.getcwd())
-                main_folder = f"{local_folder}/attn_scores"
-                folder = self.get_folder(main_folder)
-                file_name = f"{folder}/token_ids.csv"
-                with open(file_name, 'a', newline='') as csvfile:
-                    writer = csv.writer(csvfile)
-                    writer.writerow(request_outputs[0].prompt_token_ids)
-                    writer.writerow(request_outputs[0].outputs[0].token_ids)
+            # if(len(request_outputs) > 0):
+            #     logger.info("=====writing tokens=====")
+            #     local_folder = os.path.abspath(os.getcwd())
+            #     main_folder = f"{local_folder}/attn_scores"
+            #     folder = self.get_folder(main_folder)
+            #     file_name = f"{folder}/token_ids.csv"
+            #     with open(file_name, 'a', newline='') as csvfile:
+            #         writer = csv.writer(csvfile)
+            #         writer.writerow(request_outputs[0].prompt_token_ids)
+            #         writer.writerow(request_outputs[0].outputs[0].token_ids)
 
             # Send request outputs (if async, done in engine_step callback).
             if not self.use_async_sockets:

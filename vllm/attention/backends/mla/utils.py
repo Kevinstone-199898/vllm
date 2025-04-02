@@ -40,9 +40,87 @@ import csv
 from vllm.logger import init_logger
 import os
 from datetime import datetime
+from torch.profiler import profile, record_function, ProfilerActivity
+import math
+import triton
+import triton.language as tl
 
 logger = init_logger(__name__)
 
+
+@triton.jit
+def _get_kv_cache_kernel(
+    KV_cache,  #kv_cache [num_blocks, BLOCK_SIZE, kv_dim]
+    Block_tables,   #block_table [bsz, max_seq_len]
+    Seq_lens,    #seq_lens_tensor [bsz]
+    K_buffer,  #kv_buffer [bsz, max_seq_len, 512]
+    V_buffer,  #v_buffer [bsz, max_seq_len, 64]
+    BLOCK_SIZE,
+    stride_block_tables,
+    stride_cache_b,
+    stride_cache_s,
+    stride_k_buffer_b,
+    stride_k_buffer_s,
+    stride_v_buffer_b,
+    stride_v_buffer_s,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_DPE: tl.constexpr
+):
+    cur_batch = tl.program_id(0)
+    split_id = tl.program_id(1)
+    
+    cur_batch_seq_len = tl.load(Seq_lens + cur_batch)
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, BLOCK_SIZE)
+        
+    for offs_n in range(0, kv_len_per_split):
+        cur_len_id = offs_n * BLOCK_SIZE + split_id
+        if(cur_len_id < cur_batch_seq_len):
+            page_number = tl.load(Block_tables + cur_batch * stride_block_tables + offs_n)
+            kv_loc = page_number * stride_cache_b + split_id * stride_cache_s
+            offs_buf_k = kv_loc[None, :] + tl.arange(0, BLOCK_DV)
+            offs_buf_v = kv_loc[None, :] + tl.arange(0, BLOCK_DPE) + BLOCK_DV
+            k = tl.load(KV_cache + offs_buf_k)
+            v = tl.load(KV_cache + offs_buf_v)
+
+            k_buffer_loc = cur_batch * stride_k_buffer_b + (offs_n * BLOCK_SIZE + split_id) * stride_k_buffer_s 
+            v_buffer_loc = cur_batch * stride_v_buffer_b + (offs_n * BLOCK_SIZE + split_id) * stride_v_buffer_s
+            off_k_buffer_loc = k_buffer_loc[None, :] + tl.arange(0, BLOCK_DV)
+            off_v_buffer_loc = v_buffer_loc[None, :] + tl.arange(0, BLOCK_DPE)
+            tl.store(K_buffer + off_k_buffer_loc, k)
+            tl.store(V_buffer + off_v_buffer_loc, v)
+
+@triton.jit
+def _select_kv_cache_kernel(
+    cache,  #v_c_cache [bsz, max_seq_lens, dim]
+    Top_k,    #[bsz]
+    Indices,   #[bsz, max_seq_len]
+    Select_cache,  #kv_buffer [bsz, max_seq_len, dim]
+    BLOCK_SIZE,
+    stride_Indices,
+    stride_cache_b,
+    stride_cache_s,
+    stride_select_cache_b,
+    stride_select_cache_s,
+    BLOCK_DV: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    split_id = tl.program_id(1)
+    
+    cur_batch_seq_len = tl.load(Top_k + cur_batch)
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, BLOCK_SIZE)
+    
+    for offs_n in range(0, kv_len_per_split):
+        cur_len_id = offs_n * BLOCK_SIZE + split_id
+        # tl.device_print("cur_len_id", cur_len_id)
+        if(cur_len_id < cur_batch_seq_len):
+            index = tl.load(Indices + cur_batch * stride_Indices + cur_len_id)
+            cache_loc = cur_batch*stride_cache_b + index*stride_cache_s
+            offs_cache = cache_loc[None, :] + tl.arange(0, BLOCK_DV)
+            select_tensor = tl.load(cache + offs_cache)
+
+            select_cache_loc = cur_batch*stride_select_cache_b + cur_len_id*stride_select_cache_s
+            select_offs_cache = select_cache_loc[None, :] + tl.arange(0, BLOCK_DV)
+            tl.store(Select_cache + select_offs_cache, select_tensor)
 
 @dataclass
 class MLACommonMetadata(AttentionMetadata):
@@ -190,43 +268,131 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         self.kv_b_proj = kv_b_proj
         self.o_proj = o_proj
         self.sparsity = os.getenv('SPARSITY')
-        # print(f"--->sparsity: {self.sparsity}")
+        if (self.sparsity != None ):
+            print(f"--->sparsity: {self.sparsity}")
         self.top_k = os.getenv('TOP_K')
         # print(f"--->top_k: {self.top_k}")
         self.layer_idx = layer_idx
         # print(f"--->layer_idx: {self.layer_idx}")
-        self.save_score = 1
+        # self.save_score = 1
+        self.max_bsz = 64
+        self.max_seq_len = 4000
+        self.kv_c_buffer = None
+        self.k_pe_buffer = None
+        self.select_kv_c_buffer = None
+        self.select_k_pe_buffer = None
 
-    @torch.compile
+    # @torch.compile
+    # def new_get_kv_cache(
+    #     self,
+    #     kv_cache: torch.Tensor,
+    #     attn_metadata:T
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     # 获取解码序列的batch大小
+    #     bsz = attn_metadata.num_decode_tokens
+    #     max_seq_len = max(attn_metadata.seq_lens)
+    #     local_kv_c_cache = self.kv_c_buffer[:bsz*max_seq_len, :].view(bsz, max_seq_len, self.kv_lora_rank)
+    #     local_k_pe_cache = self.k_pe_buffer[:bsz*max_seq_len, :].view(bsz, max_seq_len, self.qk_rope_head_dim)
+    #     # kv_c_cache = torch.zeros((bsz, max_seq_len, self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+    #     # k_pe_cache = torch.zeros((bsz, max_seq_len, 64), device=kv_cache.device, dtype=kv_cache.dtype)
+
+    #     for i in range(bsz):
+    #         # kv_c_and_k_pe_cache = torch.zeros(0, kv_cache.shape[2]).to(kv_cache.device)
+    #         pos = 0
+    #         seq_len = attn_metadata.seq_lens[i]
+    #         block_table = attn_metadata.block_tables[i]
+    #         slot_mapping = attn_metadata.slot_mapping[i]
+
+    #         block_size = kv_cache.shape[1]
+    #         num_blocks = (seq_len + block_size - 1) // block_size
+    #         for index in range(num_blocks):
+    #             j = block_table[index]
+    #             if index == num_blocks - 1:
+    #                 end_slot = slot_mapping - j*kv_cache.shape[1] + 1
+    #                 local_kv_c_cache[i][pos:pos+end_slot, :] = kv_cache[j][:end_slot, :self.kv_lora_rank]
+    #                 local_k_pe_cache[i][pos:pos+end_slot, :] = kv_cache[j][:end_slot, self.kv_lora_rank:]
+    #                 break
+    #             local_kv_c_cache[i][pos:pos+block_size, :] = kv_cache[j][:, :self.kv_lora_rank]
+    #             local_k_pe_cache[i][pos:pos+block_size, :] = kv_cache[j][:, self.kv_lora_rank:]
+    #             pos += block_size
+    #     return local_kv_c_cache, local_k_pe_cache
+
+    def new_get_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata: T
+    ) -> torch.Tensor:
+        # 获取解码序列的batch大小
+        bsz = attn_metadata.num_decode_tokens
+        max_seq_len = max(attn_metadata.seq_lens)
+        BLOCK_SIZE = kv_cache.shape[1]
+        BLOCK_DV = self.kv_lora_rank
+        BLOCK_DPE = kv_cache.shape[2] - self.kv_lora_rank
+        k_buffer = torch.empty((bsz, max_seq_len, BLOCK_DV), device=kv_cache.device, dtype=kv_cache.dtype)
+        v_buffer = torch.empty((bsz, max_seq_len, BLOCK_DPE), device=kv_cache.device, dtype=kv_cache.dtype)
+        grid = (
+            bsz,
+            BLOCK_SIZE
+        )
+
+        _get_kv_cache_kernel[grid](
+            kv_cache,
+            attn_metadata.block_tables,
+            attn_metadata.seq_lens_tensor,
+            k_buffer,
+            v_buffer,
+            BLOCK_SIZE,
+            attn_metadata.block_tables.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_DPE=BLOCK_DPE
+        )
+
+        return k_buffer, v_buffer
+
     def get_kv_cache(
         self,
         kv_cache: torch.Tensor,
-        attn_metadata:T
+        attn_metadata: T
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 获取解码序列的batch大小
         bsz = attn_metadata.num_decode_tokens
         max_seq_len = max(attn_metadata.seq_lens)
-        kv_c_cache = torch.zeros((bsz, max_seq_len, self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
-        k_pe_cache = torch.zeros((bsz, max_seq_len, kv_cache.shape[2] - self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+        BLOCK_SIZE = kv_cache.shape[1]
+        BLOCK_DV = self.kv_lora_rank
+        BLOCK_DPE = self.qk_rope_head_dim
+        k_buffer = torch.empty((bsz, max_seq_len, BLOCK_DV), device=kv_cache.device, dtype=kv_cache.dtype)
+        pe_buffer = torch.empty((bsz, max_seq_len, BLOCK_DPE), device=kv_cache.device, dtype=kv_cache.dtype)
+        
+        grid = (
+            bsz,
+            BLOCK_SIZE
+        )
 
-        for i in range(bsz):
-            kv_c_and_k_pe_cache = torch.zeros(0, kv_cache.shape[2]).to(kv_cache.device)
-            seq_len = attn_metadata.seq_lens[i]
-            block_table = attn_metadata.block_tables[i]
-            slot_mapping = attn_metadata.slot_mapping[i]
+        _get_kv_cache_kernel[grid](
+            kv_cache,
+            attn_metadata.block_tables,
+            attn_metadata.seq_lens_tensor,
+            k_buffer,
+            pe_buffer,
+            BLOCK_SIZE,
+            attn_metadata.block_tables.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            pe_buffer.stride(0),
+            pe_buffer.stride(1),
+            BLOCK_DV,
+            BLOCK_DPE
+        )
 
-            block_size = kv_cache.shape[1]
-            num_blocks = (seq_len + block_size - 1) // block_size
-            for index in range(num_blocks):
-                j = block_table[index]
-                if index == num_blocks - 1:
-                    end_slot = slot_mapping - j*kv_cache.shape[1] + 1
-                    kv_c_and_k_pe_cache = torch.cat((kv_c_and_k_pe_cache, kv_cache[j][:end_slot]), dim=0) 
-                    break
-                kv_c_and_k_pe_cache = torch.cat((kv_c_and_k_pe_cache, kv_cache[j]), dim=0)
-            kv_c_cache[i][:attn_metadata.seq_lens[i], :] = kv_c_and_k_pe_cache[..., :self.kv_lora_rank]
-            k_pe_cache[i][:attn_metadata.seq_lens[i], :] = kv_c_and_k_pe_cache[..., self.kv_lora_rank:]
-        return kv_c_cache, k_pe_cache
+        return k_buffer, pe_buffer
 
     def _v_up_proj_and_o_proj(self, x):
         if envs.VLLM_MLA_PERFORM_MATRIX_ABSORPTION:
@@ -462,7 +628,6 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         _, indices = torch.topk(mean, top_k)
         return indices
     
-    @torch.compile
     def compute_attn_score(
         self,
         q_pe: torch.Tensor, 
@@ -470,16 +635,15 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         k_pe_cache: torch.Tensor,
         kv_c_cache: torch.Tensor,
         seq_lens: List,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         attn_weights_pe = torch.matmul(q_pe, k_pe_cache.transpose(1, 2))
         attn_weights_nope = torch.matmul(q_nope, kv_c_cache.transpose(1, 2))
         logits = (attn_weights_pe + attn_weights_nope) * self.scale
         seq_lens = torch.tensor(seq_lens, device=logits.device)
         mask = torch.arange(logits.size(2), device=logits.device) >= seq_lens.view(-1, 1, 1)
         logits.masked_fill_(mask, float('-inf'))
-        lse = logits.logsumexp(dim=-1)
         attn_weights = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32).to(q_nope.dtype)
-        return attn_weights, lse
+        return attn_weights
     
     def flash_attn_score(
         self,
@@ -538,6 +702,87 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                     latest_datetime = max(datetime_objects)
         return f"{folder}/{latest_datetime.strftime(time_format)}"
 
+
+    def select_kv_cache(
+        self,
+        kv_c_cache: torch.Tensor,
+        k_pe_cache: torch.Tensor,
+        attn_metadata: T,
+        indices: torch.Tensor,
+        sparsity:float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 获取解码序列的batch大小
+        bsz = attn_metadata.num_decode_tokens
+        top_k = [math.ceil(x * sparsity) for x in attn_metadata.seq_lens]
+        max_len = max(top_k)
+        top_k = torch.tensor(top_k, device=kv_c_cache.device, dtype=attn_metadata.seq_lens_tensor.dtype)
+        selected_k_pe_cache = torch.empty((bsz, max_len, k_pe_cache.size(2)), device=k_pe_cache.device, dtype=k_pe_cache.dtype)
+        selected_kv_c_cache = torch.empty((bsz, max_len, kv_c_cache.size(2)), device=kv_c_cache.device, dtype=kv_c_cache.dtype)
+        BLOCK_SIZE = 16
+        BLOCK_DV = self.kv_lora_rank
+        BLOCK_DPE = self.qk_rope_head_dim
+
+        grid = (
+            bsz,
+            BLOCK_SIZE
+        )
+        _select_kv_cache_kernel[grid](
+            kv_c_cache,
+            top_k,
+            indices,
+            selected_kv_c_cache,
+            BLOCK_SIZE,
+            indices.stride(0),
+            kv_c_cache.stride(0),
+            kv_c_cache.stride(1),
+            selected_kv_c_cache.stride(0),
+            selected_kv_c_cache.stride(1),
+            BLOCK_DV,
+        )
+
+        _select_kv_cache_kernel[grid](
+            k_pe_cache,
+            top_k,
+            indices,
+            selected_k_pe_cache,
+            BLOCK_SIZE,
+            indices.stride(0),
+            k_pe_cache.stride(0),
+            k_pe_cache.stride(1),
+            selected_k_pe_cache.stride(0),
+            selected_k_pe_cache.stride(1),
+            BLOCK_DPE,
+        )
+        return selected_kv_c_cache, selected_k_pe_cache
+
+    @torch.compile
+    def get_index(self, attn_weights, top_k):
+        index = []
+        for i in range(len(top_k)):
+            index.append(torch.sort(torch.topk(torch.mean(attn_weights[i],dim=0), top_k[i]).indices).values)
+        return index
+
+    def new_absorbed_forward(
+        self,
+        q_nope: torch.Tensor, 
+        q_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: T,
+        top_k: str = None,
+        sparsity: str = None,
+    ):
+        if(attn_metadata.seq_lens != None):
+            kv_c_cache, k_pe_cache = self.new_get_kv_cache(kv_cache, attn_metadata)
+            attn_weights = self.compute_attn_score(q_pe, q_nope, k_pe_cache, kv_c_cache, attn_metadata.seq_lens) 
+            top_k = [math.ceil(x * float(sparsity)) for x in attn_metadata.seq_lens]
+            index = self.get_index(attn_weights, top_k)
+            selected_k_pe_cache, selected_kv_c_cache = self.select_kv_cache(kv_c_cache, k_pe_cache, index)
+            selected_attn_weights = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, top_k)
+            attn_output = torch.matmul(selected_attn_weights, selected_kv_c_cache)
+            return self._v_up_proj_and_o_proj(attn_output)
+        else:
+            return torch.zeros((attn_metadata.num_decode_tokens, self.v_head_dim*self.num_heads), device=self.W_UV_O.device, dtype=self.W_UV_O.dtype)
+
     def absorbed_forward(
         self,
         q_nope: torch.Tensor, 
@@ -549,25 +794,26 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
     ):
         if(attn_metadata.seq_lens != None):
             bsz = attn_metadata.num_decode_tokens
+            # kv_c_cache, k_pe_cache = self.new_get_kv_cache(kv_cache, attn_metadata)
             kv_c_cache, k_pe_cache = self.get_kv_cache(kv_cache, attn_metadata)
-            attn_weights , _ = self.compute_attn_score(q_pe, q_nope, k_pe_cache, kv_c_cache, attn_metadata.seq_lens) 
+            attn_weights = self.compute_attn_score(q_pe, q_nope, k_pe_cache, kv_c_cache, attn_metadata.seq_lens) 
 
-            if(self.layer_idx != None and self.save_score):
-                cur_dir = os.path.abspath(os.getcwd())
-                main_folder = f"{cur_dir}/attn_scores"
-                folder = self.get_folder(main_folder)
-                file_name = f"{folder}/layer_{self.layer_idx+1}/tp_{self.rank}.csv"
-                if os.path.exists(file_name):
-                    with open(file_name, mode='a', newline='') as file:
-                        writer = csv.writer(file)
-                        for i in range(attn_weights.size(1)):
-                            writer.writerow(attn_weights[0][i].to(torch.float32).cpu().numpy())
-                else:
-                    with open(file_name, mode='w', newline='') as file:
-                        writer = csv.writer(file)
-                        for i in range(attn_weights.size(1)):
-                            writer.writerow(attn_weights[0][i].to(torch.float32).cpu().numpy())
-            return
+            # if(self.layer_idx != None and self.save_score):
+            #     cur_dir = os.path.abspath(os.getcwd())
+            #     main_folder = f"{cur_dir}/attn_scores"
+            #     folder = self.get_folder(main_folder)
+            #     file_name = f"{folder}/layer_{self.layer_idx+1}/tp_{self.rank}.csv"
+            #     if os.path.exists(file_name):
+            #         with open(file_name, mode='a', newline='') as file:
+            #             writer = csv.writer(file)
+            #             for i in range(attn_weights.size(1)):
+            #                 writer.writerow(attn_weights[0][i].to(torch.float32).cpu().numpy())
+            #     else:
+            #         with open(file_name, mode='w', newline='') as file:
+            #             writer = csv.writer(file)
+            #             for i in range(attn_weights.size(1)):
+            #                 writer.writerow(attn_weights[0][i].to(torch.float32).cpu().numpy())
+            # return
 
             if(top_k != None):
                 #sparse top-k
@@ -576,40 +822,36 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 index = torch.sort(index, dim=1).values
                 selected_k_pe_cache = k_pe_cache[torch.arange(k_pe_cache.size(0)).unsqueeze(1), index]
                 selected_kv_c_cache = kv_c_cache[torch.arange(kv_c_cache.size(0)).unsqueeze(1), index]
-                selected_attn_weights , _ = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, [top_k]*len(attn_metadata.seq_lens))
+                selected_attn_weights = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, [top_k]*len(attn_metadata.seq_lens))
                 attn_output = torch.matmul(selected_attn_weights, selected_kv_c_cache)   
             elif (sparsity != None):
+                # sparsity = float(sparsity)
+                # import math
+                # top_k = [math.ceil(x * sparsity) for x in attn_metadata.seq_lens]
+                # max_len = max(top_k)
+                # selected_k_pe_cache = torch.zeros((bsz, max_len, k_pe_cache.size(2)), device=k_pe_cache.device, dtype=k_pe_cache.dtype)
+                # selected_kv_c_cache = torch.zeros((bsz, max_len, kv_c_cache.size(2)), device=kv_c_cache.device, dtype=kv_c_cache.dtype)
+                # for i in range(len(attn_metadata.seq_lens)):
+                #     index = torch.topk(torch.mean(attn_weights[i],dim=0), top_k[i]).indices
+                #     index = torch.sort(index).values
+                #     selected_k_pe_cache[i][:top_k[i], :] = k_pe_cache[i][index]
+                #     selected_kv_c_cache[i][:top_k[i], :] = kv_c_cache[i][index]
+                # selected_attn_weights = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, top_k)
+                # attn_output = torch.matmul(selected_attn_weights, selected_kv_c_cache)
+                # logger.info("=====sparse!!!!!=====")
                 sparsity = float(sparsity)
-                import math
                 top_k = [math.ceil(x * sparsity) for x in attn_metadata.seq_lens]
-                max_len = max(top_k)
-                selected_k_pe_cache = torch.zeros((bsz, max_len, k_pe_cache.size(2)), device=k_pe_cache.device, dtype=k_pe_cache.dtype)
-                selected_kv_c_cache = torch.zeros((bsz, max_len, kv_c_cache.size(2)), device=kv_c_cache.device, dtype=kv_c_cache.dtype)
-                for i in range(len(attn_metadata.seq_lens)):
-                    index = torch.topk(torch.mean(attn_weights[i],dim=0), top_k[i]).indices
-                    index = torch.sort(index).values
-                    selected_k_pe_cache[i][:top_k[i], :] = k_pe_cache[i][index]
-                    selected_kv_c_cache[i][:top_k[i], :] = kv_c_cache[i][index]
-                # mla_data = {}
-                # mla_data['selected_k_pe_cache'] = selected_k_pe_cache
-                # mla_data['selected_kv_c_cache'] = selected_kv_c_cache
-                # mla_data["q_pe"] = q_pe
-                # mla_data["q_nope"] = q_nope
-                # mla_data["attn_metadata"] = attn_metadata
-                # mla_data["top_k"] = top_k
-                selected_attn_weights, lse = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, top_k)
+                mean_attn_weights = torch.mean(attn_weights,dim=1)
+                _, indices = torch.sort(mean_attn_weights, dim=1,descending=True)
+                selected_kv_c_cache, selected_k_pe_cache = self.select_kv_cache(kv_c_cache, k_pe_cache, attn_metadata, indices, sparsity)
+                selected_attn_weights = self.compute_attn_score(q_pe, q_nope, selected_k_pe_cache, selected_kv_c_cache, top_k)
                 attn_output = torch.matmul(selected_attn_weights, selected_kv_c_cache)
-                # mla_data["attn_output"] = attn_output
-                # mla_data["lse"] = lse
-                # torch.save(mla_data, "mla_data.pt")
-                # exit()
             else:
                 attn_output = torch.matmul(attn_weights, kv_c_cache)
-            return self._v_up_proj_and_o_proj(attn_output)
         else:
-            return torch.zeros((attn_metadata.num_decode_tokens, self.v_head_dim*self.num_heads), device=self.W_UV_O.device, dtype=self.W_UV_O.dtype)
+            attn_output = torch.zeros((attn_metadata.num_decode_tokens, self.v_head_dim*self.num_heads), device=self.W_UV_O.device, dtype=self.W_UV_O.dtype)
+        return self._v_up_proj_and_o_proj(attn_output) 
     
-
     def forward(
         self,
         layer: AttentionLayer,
@@ -666,9 +908,19 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         if attn_metadata.prefill_metadata is not None:
             return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata)
 
+        # if (self.sparsity != None and self.kv_c_buffer == None):
+        #     self.kv_c_buffer = torch.empty((self.max_bsz*self.max_seq_len, self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+        #     self.k_pe_buffer = torch.empty((self.max_bsz*self.max_seq_len, kv_cache.shape[2] - self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+        #     self.select_kv_c_buffer = torch.empty((math.ceil(self.max_bsz*self.max_seq_len*float(self.sparsity)), self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+        #     self.select_k_pe_buffer = torch.empty((math.ceil(self.max_bsz*self.max_seq_len*float(self.sparsity)), kv_cache.shape[2] - self.kv_lora_rank), device=kv_cache.device, dtype=kv_cache.dtype)
+
         if attn_metadata.decode_metadata is not None:
-            self.absorbed_forward(q_nope, q_pe, kv_cache, attn_metadata, top_k=self.top_k, sparsity=self.sparsity)
-            return self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata)
+            # activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            if(self.sparsity != None):
+                # return self.new_absorbed_forward(q_nope, q_pe, kv_cache, attn_metadata, top_k=self.top_k, sparsity=self.sparsity)
+                return self.absorbed_forward(q_nope, q_pe, kv_cache, attn_metadata, top_k=self.top_k, sparsity=self.sparsity)
+            else:
+                return self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata)
 
     # Optional common flash-attn based prefill
     def _forward_prefill_flash(
